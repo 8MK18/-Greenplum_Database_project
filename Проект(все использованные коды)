@@ -1,0 +1,70 @@
+CREATE OR REPLACE FUNCTION std2_33.f_project_itog_vitrina(start_date date)
+	RETURNS text
+	LANGUAGE plpgsql
+	VOLATILE
+AS $$
+	
+DECLARE 
+	start_date date := start_date + '1 month'::interval;
+	table_name text := 'std2_33.a_project';
+    v_sql text;
+begin
+	EXECUTE 'DROP VIEW IF EXISTS ' || table_name || ';';
+   
+	EXECUTE 'DROP TABLE IF EXISTS ' || table_name || ';';
+  
+    EXECUTE v_sql;
+
+    v_sql := 'CREATE TABLE ' || table_name || ' as 
+        with x as (
+        select w.store, count(w.numer_coupon) as val_coupons, sum(w.discount) as discount 
+        from (
+            select distinct co.store, co.numer_coupon,
+                (case 
+                    when pr.type_promo = 1 then pr.size_sale 
+                    else bi.rpa_sat / bi.qty / 100 * pr.size_sale
+                end) as discount,
+                count(co.numer_coupon) as val_coupons
+            from std2_33.t_coupons co
+            join std2_33.t_bills_item bi on co.receipt = bi.billnum and co.product::int8 = bi.material 
+            join std2_33.t_promos pr on co.promo_stock = pr.id_promo 
+            group by 1, 2, 3
+            order by 1
+        ) as w
+        group by 1
+    ), z as (
+        select plant as store, sum(quantity) as traffic
+        from std2_33.t_traffic
+        group by 1
+    )
+    select st.store, st.txt, sum(bi.rpa_sat) as turnover, x.discount, 
+        sum(bi.qty) as qty, count(distinct bh.billnum) as val_checks, z.traffic, x.val_coupons
+    from std2_33.t_stores st
+    join std2_33.t_bills_head bh on st.store = bh.plant 
+    join std2_33.t_bills_item bi on bh.billnum = bi.billnum
+    join x on st.store = x.store
+    join z on st.store = z.store
+    group by 1, 2, 4, 7, 8
+    order by 1;';
+   
+    v_sql := 'create or replace view ' || table_name || 'ect as 
+	select stores, txt as name_stores,turnover,discount, (turnover-discount) as turnover_without_discount,
+	qty as quantity, val_checks,traffic,val_coupons,
+	(val_coupons*100/qty)::numeric(5,1) as percent_material_with_discount,
+	(qty/val_checks) ::numeric(5,2) as avg_material_in_checks,
+	(val_checks::numeric(10,2)/traffic*100)::numeric(5,2) as convers,
+	(turnover/val_checks)::numeric(10,1) as avg_checks,
+	coalesce(turnover/traffic)::numeric(10,1) as avg_customers
+	from ' || table_name || ' 
+	order by 1 ;';
+
+
+
+    RAISE NOTICE 'QUERY IS: %', v_sql;
+
+    EXECUTE v_sql;
+    RETURN 'ok';
+END;
+
+$$
+EXECUTE ON ANY;
