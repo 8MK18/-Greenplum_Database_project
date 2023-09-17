@@ -68,3 +68,626 @@ END;
 
 $$
 EXECUTE ON ANY;
+
+CREATE OR REPLACE FUNCTION std2_33.f_load_full(p_table text)
+	RETURNS int4
+	LANGUAGE plpgsql
+	VOLATILE
+AS $$
+	
+DECLARE
+	table_i text := 'std2_33.t_' || p_table;
+    table_ext_name text;
+    sql_exe text;
+    gpfd text;
+    result1 int4;
+BEGIN
+    table_ext_name := table_i || '_ext';
+    EXECUTE 'DROP EXTERNAL TABLE IF EXISTS ' || table_ext_name;
+    EXECUTE 'TRUNCATE TABLE ' || table_i;
+    gpfd := 'gpfdist://172.16.128.214:8080/' || p_table || '.csv';
+    sql_exe := 'CREATE EXTERNAL TABLE ' || table_ext_name || '(LIKE ' || table_i || ')
+        LOCATION (''' || gpfd || ''') ON ALL
+        FORMAT ''CSV'' (DELIMITER '';'' NULL '''' ESCAPE ''"'' QUOTE ''"'')
+        ENCODING ''UTF8''';
+    RAISE NOTICE '%', sql_exe;
+    EXECUTE sql_exe;
+    EXECUTE 'INSERT INTO ' || table_i || ' SELECT * FROM ' || table_ext_name;
+    EXECUTE 'SELECT COUNT(1) FROM ' || table_i INTO result1;
+    RETURN result1;
+END;
+
+$$
+EXECUTE ON ANY;
+
+
+
+
+CREATE OR REPLACE FUNCTION std2_33.f_load_simple_upsert(p_table text, p_table_i text, p_where_key text, p_start_date timestamp, p_end_date timestamp, p_pxf_table text, p_pxf_table_i text, p_user_id text, p_pass text)
+	RETURNS int4
+	LANGUAGE plpgsql
+	VOLATILE
+AS $$
+	
+	
+DECLARE
+    v_ext_table text;
+    v_temp_table text;
+    v_ext_table_i text;
+    v_temp_table_i text;
+    v_sql text;
+    v_pxf text;
+    v_result int;
+    v_dist_key text;
+    v_params text;
+    v_where text;
+    v_load_interval interval;
+    v_start_date date;
+    v_end_date date;
+    v_table_oid oid;
+    v_cnt int8;
+    v_param_values text;
+    v_key text;
+begin
+	/*здесь собираем название внешней таблицы и временной таблицы*/
+    v_ext_table := p_table || '_ext';
+    v_temp_table := p_table || '_tmp';
+   
+
+    /*если таблица распределена по ключу - будут записи и можем определить ключ дистрибуции*/
+    SELECT c.oid
+    INTO v_table_oid
+    FROM pg_class AS c INNER JOIN pg_namespace AS n ON c.relnamespace = n.oid
+    WHERE n.nspname || '.' || c.relname = p_table
+    LIMIT 1;
+    
+   
+    /*если таблица распределена по ключу - будут записи и можем определить ключ дистрибуции*/
+    IF v_table_oid = 0 OR v_table_oid IS NULL THEN
+        v_dist_key := 'DISTRIBUTED RANDOMLY';
+    ELSE
+        v_dist_key := pg_get_table_distributedby(v_table_oid);
+    END IF;
+    
+    /*если таблица распределена по ключу - будут записи и можем определить ключ дистрибуции*/
+    IF v_table_oid IS NOT NULL THEN
+        v_key := REPLACE (REPLACE (pg_get_table_distributedby(v_table_oid), ')','' ), 'DISTRIBUTED BY (', '');
+    END IF;
+   
+   
+   
+    /*здесь получаем тип таблицы и набор параметров для аппенд таблицы*/
+    SELECT COALESCE('with (' || ARRAY_TO_STRING(reloptions, ', ') || ')', '')
+    FROM pg_class
+    INTO v_params
+    WHERE oid = p_table::REGCLASS;
+
+    /*здесь удаляем внешнюю таблицу если сушествует*/
+    EXECUTE 'DROP EXTERNAL TABLE IF EXISTS ' || v_ext_table;
+
+    /*здесь получаем набор данных для партиционирования*/
+    v_start_date := p_start_date;
+    v_end_date := p_end_date;
+
+    /*здесь собираем период для where*/
+    v_where := p_where_key || ' >= ''' || v_start_date || '''::date AND ' || p_where_key || ' < ''' || v_end_date || '''::date';
+   
+    /*здесь собираем строку подлючения pfx*/
+    v_pxf := 'pxf://' || p_pxf_table || '?PROFILE=Jdbc&JDBC_DRIVER=org.postgresql.Driver&DB_URL=jdbc:postgresql://192.168.214.212:5432/postgres&USER='
+        || p_user_id || '&PAss=' || p_pass;
+    
+    /*выводим в лог собранную строку для подключения по pfx*/
+    RAISE NOTICE 'PXF CONNECTION STRING: %', v_pxf;
+
+    /*собираем код создания внешней таблицы (пока еще только код, не выполняем его)*/
+    v_sql := 'CREATE EXTERNAL TABLE ' || v_ext_table || ' (LIKE ' || p_table || ')
+              LOCATION (''' || v_pxf || '''
+              ) ON ALL
+              FORMAT ''CUSTOM'' (FORMATTER=''pxfwritable_import'')
+              ENCODING ''UTF8''';
+    /*выводим в лог код создания внешней таблицы*/
+    RAISE NOTICE 'EXTERNAL TABLE IS: %', v_sql;
+    
+    /*запускаем скрипт для создания внешней таблицы*/
+    EXECUTE v_sql;
+    
+    /*собираем код создания временной таблицы (пока еще только код, не выполняем его)**/
+	v_sql := 'DROP TABLE IF EXISTS ' || v_temp_table || ';
+          CREATE TABLE ' || v_temp_table || ' (LIKE ' || p_table || ') ' || v_params || ' ' || v_dist_key || ';';
+             
+    /*выводим в лог код создания временной таблицы*/         
+    RAISE NOTICE 'TEMP TABLE IS: %', v_sql;
+    
+    /*запускаем скрипт создания временной таблицы*/
+    EXECUTE v_sql;
+    
+    /*собираем код для вставки данных из внешней таблицы во временную*/
+    v_sql := 'INSERT INTO ' || v_temp_table || ' SELECT * FROM ' || v_ext_table || ' WHERE ' || v_where;
+   
+    /*запускаем скрипт вставки данных из внешней таблицы во временную*/
+    EXECUTE v_sql;
+    
+    /*получаем количество строк и выводим в лог это число*/
+    GET DIAGNOSTICS v_cnt = ROW_COUNT;
+    RAISE NOTICE 'INSERTED ROWS: %', v_cnt;
+    
+    /*ON CONFLICT не работает? собираем строку название столбцов для обновления данных, исключая столбцы, которые используются для дистрибуции*/
+    /*SELECT string_agg('d.' || column_name || ' = tmp.' || column_name, ', ' order by ordinal_position) into v_param_values
+	FROM information_schema.columns
+	WHERE table_schema||'.'||table_name = p_table and v_dist_key not like '%'|| column_name || '%' ;*/
+   
+    
+    /*собираем код upsert удаляем строки в целевой таблице которые есть в темповой. смотрим по ключу*/
+    v_sql := 'DELETE FROM ' || p_table || ' WHERE (' || v_key || ') in (SELECT ' || v_key || ' FROM ' || v_temp_table || ')';
+    
+    /*выводим код удаления*/
+    RAISE NOTICE 'DELETE SCRIPT: %', v_sql;
+    /*запускаем скрипт удаления*/
+    EXECUTE v_sql;
+
+    /*собираем код upsert вставки в целевую из временой*/
+    v_sql := 'INSERT INTO ' || p_table || ' SELECT * FROM ' || v_temp_table;
+    
+    /*выводим код вставки*/
+    RAISE NOTICE 'INSERT SCRIPT: %', v_sql;
+    /*запускаем скрипт вставки*/
+    EXECUTE v_sql;
+    
+
+    /*здесь собираем название внешней таблицы и временной таблицы*/
+    v_ext_table_i := p_table_i || '_ext';
+    v_temp_table_i := p_table_i || '_tmp';
+   
+
+    /*если таблица распределена по ключу - будут записи и можем определить ключ дистрибуции*/
+    SELECT c.oid
+    INTO v_table_oid
+    FROM pg_class AS c INNER JOIN pg_namespace AS n ON c.relnamespace = n.oid
+    WHERE n.nspname || '.' || c.relname = p_table_i
+    LIMIT 1;
+    
+   
+    /*если таблица распределена по ключу - будут записи и можем определить ключ дистрибуции*/
+    IF v_table_oid = 0 OR v_table_oid IS NULL THEN
+        v_dist_key := 'DISTRIBUTED RANDOMLY';
+    ELSE
+        v_dist_key := pg_get_table_distributedby(v_table_oid);
+    END IF;
+    
+    /*если таблица распределена по ключу - будут записи и можем определить ключ дистрибуции*/
+    IF v_table_oid IS NOT NULL THEN
+        v_key := REPLACE (REPLACE (pg_get_table_distributedby(v_table_oid), ')','' ), 'DISTRIBUTED BY (', '');
+    END IF;
+   
+   
+   
+    /*здесь получаем тип таблицы и набор параметров для аппенд таблицы*/
+    SELECT COALESCE('with (' || ARRAY_TO_STRING(reloptions, ', ') || ')', '')
+    FROM pg_class
+    INTO v_params
+    WHERE oid = p_table_i::REGCLASS;
+
+    /*здесь удаляем внешнюю таблицу если сушествует*/
+    EXECUTE 'DROP EXTERNAL TABLE IF EXISTS ' || v_ext_table_i;
+
+    /*здесь собираем строку подлючения pfx*/
+    v_pxf := 'pxf://' || p_pxf_table_i || '?PROFILE=Jdbc&JDBC_DRIVER=org.postgresql.Driver&DB_URL=jdbc:postgresql://192.168.214.212:5432/postgres&USER='
+        || p_user_id || '&PAss=' || p_pass;
+    
+    /*выводим в лог собранную строку для подключения по pfx*/
+    RAISE NOTICE 'PXF CONNECTION STRING: %', v_pxf;
+
+    /*собираем код создания внешней таблицы (пока еще только код, не выполняем его)*/
+    v_sql := 'CREATE EXTERNAL TABLE ' || v_ext_table_i || ' (LIKE ' || p_table_i || ')
+              LOCATION (''' || v_pxf || '''
+              ) ON ALL
+              FORMAT ''CUSTOM'' (FORMATTER=''pxfwritable_import'')
+              ENCODING ''UTF8''';
+    /*выводим в лог код создания внешней таблицы*/
+    RAISE NOTICE 'EXTERNAL TABLE IS: %', v_sql;
+    
+    /*запускаем скрипт для создания внешней таблицы*/
+    EXECUTE v_sql;
+    
+    /*собираем код создания временной таблицы (пока еще только код, не выполняем его)**/
+	v_sql := 'DROP TABLE IF EXISTS ' || v_temp_table_i || ';
+          CREATE TABLE ' || v_temp_table_i || ' (LIKE ' || p_table_i || ') ' || v_params || ' ' || v_dist_key || ';';
+             
+    /*выводим в лог код создания временной таблицы*/         
+    RAISE NOTICE 'TEMP TABLE IS: %', v_sql;
+    
+    /*запускаем скрипт создания временной таблицы*/
+    EXECUTE v_sql;
+    
+    /*собираем код для вставки данных из внешней таблицы во временную*/
+    v_sql := 'INSERT INTO ' || v_temp_table_i || ' SELECT * FROM ' || v_ext_table_i || ' WHERE (' || v_key || ') in (SELECT ' || v_key || ' FROM ' || v_temp_table || ')';
+   
+    /*запускаем скрипт вставки данных из внешней таблицы во временную*/
+    EXECUTE v_sql;
+    
+    /*получаем количество строк и выводим в лог это число*/
+    GET DIAGNOSTICS v_cnt = ROW_COUNT;
+    RAISE NOTICE 'INSERTED ROWS: %', v_cnt;
+    
+    /*ON CONFLICT не работает? собираем строку название столбцов для обновления данных, исключая столбцы, которые используются для дистрибуции*/
+    /*SELECT string_agg('d.' || column_name || ' = tmp.' || column_name, ', ' order by ordinal_position) into v_param_values
+	FROM information_schema.columns
+	WHERE table_schema||'.'||table_name = p_table and v_dist_key not like '%'|| column_name || '%' ;*/
+   
+    
+    /*собираем код upsert удаляем строки в целевой таблице которые есть в темповой. смотрим по ключу*/
+    v_sql := 'DELETE FROM ' || p_table_i || ' WHERE (' || v_key || ') in (SELECT ' || v_key || ' FROM ' || v_temp_table || ')';
+    
+    /*выводим код удаления*/
+    RAISE NOTICE 'DELETE SCRIPT: %', v_sql;
+    /*запускаем скрипт удаления*/
+    EXECUTE v_sql;
+
+    /*собираем код upsert вставки в целевую из временой*/
+    v_sql := 'INSERT INTO ' || p_table_i || ' SELECT * FROM ' || v_temp_table_i;
+    
+    /*выводим код вставки*/
+    RAISE NOTICE 'INSERT SCRIPT: %', v_sql;
+    /*запускаем скрипт вставки*/
+    EXECUTE v_sql;
+
+    /*запускаем код в котором считаем количество вставленных строк в целевую таблицу (в where наш период)*/
+    EXECUTE 'SELECT COUNT(1) FROM ' || p_table || ' WHERE ' || v_where INTO v_result;
+    RETURN v_result;
+END;
+
+
+$$
+EXECUTE ON ANY;
+
+
+
+
+CREATE OR REPLACE FUNCTION std2_33.f_load_simple_upsert3(p_table text, p_where_key text, p_start_date timestamp, p_end_date timestamp, p_pxf_table text, p_user_id text, p_pass text)
+	RETURNS int4
+	LANGUAGE plpgsql
+	VOLATILE
+AS $$
+	
+	
+	
+DECLARE
+    v_ext_table text;
+    v_temp_table text;
+    v_sql text;
+    v_pxf text;
+    v_result int;
+    v_dist_key text;
+    v_params text;
+    v_where text;
+    v_load_interval interval;
+    v_start_date date;
+    v_end_date date;
+    v_table_oid oid;
+    v_cnt int8;
+    v_param_values text;
+    v_key text;
+begin
+	/*здесь собираем название внешней таблицы и временной таблицы*/
+    v_ext_table := p_table || '_ext';
+    v_temp_table := p_table || '_tmp';
+   
+
+    /*если таблица распределена по ключу - будут записи и можем определить ключ дистрибуции*/
+    SELECT c.oid
+    INTO v_table_oid
+    FROM pg_class AS c INNER JOIN pg_namespace AS n ON c.relnamespace = n.oid
+    WHERE n.nspname || '.' || c.relname = p_table
+    LIMIT 1;
+    
+   
+    /*если таблица распределена по ключу - будут записи и можем определить ключ дистрибуции*/
+    IF v_table_oid = 0 OR v_table_oid IS NULL THEN
+        v_dist_key := 'DISTRIBUTED RANDOMLY';
+    ELSE
+        v_dist_key := pg_get_table_distributedby(v_table_oid);
+    END IF;
+    
+    /*если таблица распределена по ключу - будут записи и можем определить ключ дистрибуции*/
+    IF v_table_oid IS NOT NULL THEN
+        v_key := REPLACE (REPLACE (pg_get_table_distributedby(v_table_oid), ')','' ), 'DISTRIBUTED BY (', '');
+    END IF;
+   
+   
+   
+    /*здесь получаем тип таблицы и набор параметров для аппенд таблицы*/
+    SELECT COALESCE('with (' || ARRAY_TO_STRING(reloptions, ', ') || ')', '')
+    FROM pg_class
+    INTO v_params
+    WHERE oid = p_table::REGCLASS;
+
+    /*здесь удаляем внешнюю таблицу если сушествует*/
+    EXECUTE 'DROP EXTERNAL TABLE IF EXISTS ' || v_ext_table;
+
+    /*здесь получаем набор данных для партиционирования*/
+    v_start_date := p_start_date;
+    v_end_date := p_end_date;
+
+    /*здесь собираем период для where*/
+    v_where := 'to_date(' ||p_where_key || ', ''DD.MM.YYYY'') >= ''' || v_start_date || '''::date AND to_date(' || p_where_key || ', ''DD.MM.YYYY'') < ''' || v_end_date || '''::date';
+   
+    /*здесь собираем строку подлючения pfx*/
+    v_pxf := 'pxf://' || p_pxf_table || '?PROFILE=Jdbc&JDBC_DRIVER=org.postgresql.Driver&DB_URL=jdbc:postgresql://192.168.214.212:5432/postgres&USER='
+        || p_user_id || '&PAss=' || p_pass;
+    
+    /*выводим в лог собранную строку для подключения по pfx*/
+    RAISE NOTICE 'PXF CONNECTION STRING: %', v_pxf;
+
+    /*собираем код создания внешней таблицы (пока еще только код, не выполняем его)*/
+    v_sql := 'CREATE EXTERNAL TABLE ' || v_ext_table || ' (LIKE ' || p_table || ')
+              LOCATION (''' || v_pxf || '''
+              ) ON ALL
+              FORMAT ''CUSTOM'' (FORMATTER=''pxfwritable_import'')
+              ENCODING ''UTF8''';
+    /*выводим в лог код создания внешней таблицы*/
+    RAISE NOTICE 'EXTERNAL TABLE IS: %', v_sql;
+    
+    /*запускаем скрипт для создания внешней таблицы*/
+    EXECUTE v_sql;
+    
+    /*собираем код создания временной таблицы (пока еще только код, не выполняем его)**/
+	v_sql := 'DROP TABLE IF EXISTS ' || v_temp_table || ';
+          CREATE TABLE ' || v_temp_table || ' (LIKE ' || p_table || ') ' || v_params || ' ' || v_dist_key || ';';
+             
+    /*выводим в лог код создания временной таблицы*/         
+    RAISE NOTICE 'TEMP TABLE IS: %', v_sql;
+    
+    /*запускаем скрипт создания временной таблицы*/
+    EXECUTE v_sql;
+    
+    /*собираем код для вставки данных из внешней таблицы во временную*/
+    v_sql := 'INSERT INTO ' || v_temp_table || ' SELECT * FROM ' || v_ext_table || ' WHERE ' || v_where;
+    
+   
+    RAISE NOTICE 'INSERT TEMP TABLE: %', v_sql;
+    /*запускаем скрипт вставки данных из внешней таблицы во временную*/
+    EXECUTE v_sql;
+    
+    /*получаем количество строк и выводим в лог это число*/
+    GET DIAGNOSTICS v_cnt = ROW_COUNT;
+    RAISE NOTICE 'INSERTED ROWS: %', v_cnt;
+    
+    /*ON CONFLICT не работает? собираем строку название столбцов для обновления данных, исключая столбцы, которые используются для дистрибуции*/
+    /*SELECT string_agg('d.' || column_name || ' = tmp.' || column_name, ', ' order by ordinal_position) into v_param_values
+	FROM information_schema.columns
+	WHERE table_schema||'.'||table_name = p_table and v_dist_key not like '%'|| column_name || '%' ;*/
+   
+    
+    /*собираем код upsert удаляем строки в целевой таблице которые есть в темповой. смотрим по ключу*/
+    v_sql := 'DELETE FROM ' || p_table || ' WHERE (' || v_key || ') in (SELECT ' || v_key || ' FROM ' || v_temp_table || ')';
+    
+    /*выводим код удаления*/
+    RAISE NOTICE 'DELETE SCRIPT: %', v_sql;
+    /*запускаем скрипт удаления*/
+    EXECUTE v_sql;
+
+    /*собираем код upsert вставки в целевую из временой*/
+    v_sql := 'INSERT INTO ' || p_table || ' SELECT * FROM ' || v_temp_table;
+    
+    /*выводим код вставки*/
+    RAISE NOTICE 'INSERT SCRIPT: %', v_sql;
+    /*запускаем скрипт вставки*/
+    EXECUTE v_sql;
+    
+    /*запускаем код в котором считаем количество вставленных строк в целевую таблицу (в where наш период)*/
+    EXECUTE 'SELECT COUNT(1) FROM ' || p_table || ' WHERE ' || v_where INTO v_result;
+    RETURN v_result;
+END;
+
+
+
+$$
+EXECUTE ON ANY;
+
+
+
+CREATE OR REPLACE FUNCTION std2_33.f_create_table_pr()
+	RETURNS bool
+	LANGUAGE plpgsql
+	VOLATILE
+AS $$
+	
+	
+	
+DECLARE 
+    sql_v text;
+BEGIN
+    EXECUTE 'DROP TABLE IF EXISTS std2_33.t_bills_head;' ;
+    EXECUTE 'DROP TABLE IF EXISTS std2_33.t_bills_item;' ;
+    EXECUTE 'DROP TABLE IF EXISTS std2_33.t_coupons;' ;
+    EXECUTE 'DROP TABLE IF EXISTS std2_33.t_promos;' ;
+    EXECUTE 'DROP TABLE IF EXISTS std2_33.t_promos_type;' ;
+    EXECUTE 'DROP TABLE IF EXISTS std2_33.t_stores;' ;
+    EXECUTE 'DROP TABLE IF EXISTS std2_33.t_traffic;' ;
+
+    sql_v = '
+    CREATE TABLE std2_33.t_bills_head (
+        billnum int8 NULL,
+        plant text NULL,
+        calday date NULL
+    )
+    WITH (
+        appendonly=true,
+        orientation=column,
+        compresstype=zstd,
+        compresslevel=1
+    )
+    DISTRIBUTED BY (billnum)
+    PARTITION BY RANGE(calday) (
+        START (''2020-11-01''::date) END (''2021-02-28''::date) EVERY (''1 mon''::interval) WITH (
+            appendonly=true,
+            orientation=column,
+            compresstype=zstd,
+            compresslevel=1
+        )
+    );';
+    EXECUTE sql_v;
+
+    sql_v = '
+    CREATE TABLE std2_33.t_bills_item (
+        billnum int8 NULL,
+        billitem int8 NULL,
+        material int8 NULL,
+        qty int8 NULL,
+        netval numeric(17, 2) NULL,
+        tax numeric(17, 2) NULL,
+        rpa_sat numeric(17, 2) NULL
+    )
+    WITH (
+        appendonly=true,
+        orientation=column,
+        compresstype=zstd,
+        compresslevel=1
+    )
+    DISTRIBUTED BY (billnum);';
+    EXECUTE sql_v;
+
+    sql_v = '
+    CREATE TABLE std2_33.t_coupons (
+        store text NULL,
+        "day" date NULL,
+        numer_coupon text NULL,
+        promo_stock text NULL,
+        product text NULL,
+        receipt int8 NULL
+    )
+    DISTRIBUTED REPLICATED;';
+    EXECUTE sql_v;
+
+    sql_v = '
+    CREATE TABLE std2_33.t_promos (
+        id_promo text NULL,
+        "name" text NULL,
+        type_promo int4 NULL,
+        product int8 NULL,
+        size_sale int8 NULL
+    )
+    DISTRIBUTED REPLICATED;';
+    EXECUTE sql_v;
+
+    sql_v = '
+    CREATE TABLE std2_33.t_promos_types (
+        promo_type int4 NULL,
+        txt text NULL
+    )
+    DISTRIBUTED REPLICATED;';
+    EXECUTE sql_v;
+
+    sql_v = '
+    CREATE TABLE std2_33.t_stores (
+        store text NULL,
+        txt text NULL
+    )
+    DISTRIBUTED REPLICATED;';
+    EXECUTE sql_v;
+
+    sql_v = '
+    CREATE TABLE std2_33.t_traffic (
+        plant bpchar NULL,
+        "date" bpchar NULL,
+        "time" bpchar NULL,
+        frame_id bpchar NULL,
+        quantity int4 NULL
+    )
+    WITH (
+        appendonly=true,
+        orientation=column,
+        compresstype=zstd,
+        compresslevel=1
+    )
+    DISTRIBUTED BY ("date", plant, "time");';
+    EXECUTE sql_v;
+
+    RETURN true;
+END;
+
+
+
+$$
+EXECUTE ON ANY;
+
+
+
+ /*Код в Airflow*/
+from airflow import DAG
+from datetime import datetime, timedelta, date
+from airflow.operators.dummy_operator import DummyOperator
+from airflow.providers.postgres.operators.postgres import PostgresOperator
+from airflow.utils.task_group import TaskGroup
+from airflow.models import Variable
+
+DB_CONN = 'gp_sapiens_std2_33'
+DB_SCHEMA = 'std2_33'
+
+pxf_table = ['bills_item', 'bills_head']
+gpf_table = ['coupons', 'promos', 'promos_types', 'stores']
+traffic_table = ['traffic']
+prepare = f"DROP TABLE IF EXISTS {DB_SCHEMA}.t_promos_types; select {DB_SCHEMA}.create_table_pr();"
+pxf_load = f"SELECT std2_33.f_load_simple_upsert('std2_33.t_bills_head', 'std2_33.t_bills_item', 'calday', 
+'01.01.2021', '01.03.2021', 'gp.bills_head', 'gp.bills_item', 'intern', 'intern') AS result;"
+pxf_load_traffic = f"SELECT std2_33.f_load_simple_upsert3('std2_33.t_traffic', '\"date\"', '01.01.2021', 
+'03.01.2021', 'gp.traffic', 'intern', 'intern');"
+gpf_load = f"SELECT {DB_SCHEMA}.f_load_full(%(filename)s);"
+
+trans_date = "select * from std2_33.t_traffic"
+
+project = f"SELECT {DB_SCHEMA}.f_project_itog_vitrina(%(date)s);"
+
+
+default_dag_args = {
+    'depends_on_past': False,
+    'owner': 'std2_33',
+    'start_date': datetime(2023, 9, 17),
+    'retries': 1,
+    'retry_delay': timedelta(minutes=3),
+}
+
+with DAG(
+    "std2_33.1_project",
+    max_active_runs=3,
+    schedule_interval=None,
+    default_args=default_dag_args,
+    catchup=False,
+) as dag:
+    start = DummyOperator(task_id='start')
+    create_tables = PostgresOperator(
+        task_id='create_table_pr',
+        postgres_conn_id=DB_CONN,
+        sql=prepare
+    )
+    with TaskGroup('full_insert') as full_insert:
+        for table in pxf_table:
+            task_pxf = PostgresOperator(
+                task_id=f'load_table_pxf_{table}',
+                postgres_conn_id=DB_CONN,
+                sql=pxf_load_traffic,
+                parameters={'tab_name': table}
+            )
+        for table in traffic_table:
+            task_pxf_traffic = PostgresOperator(
+                task_id=f'load_table_pxf_{table}',
+                postgres_conn_id=DB_CONN,
+                sql=pxf_load_traffic,
+                parameters={'tab_name': table}
+            )
+        for table in gpf_table:
+            task_gpf = PostgresOperator(
+                task_id=f'load_table_gpf_{table}',
+                postgres_conn_id=DB_CONN,
+                sql=gpf_load,
+                parameters={'filename': table}
+            )
+    traffic = PostgresOperator(
+        task_id='fix_date_in_traffic',
+        postgres_conn_id=DB_CONN,
+        sql=trans_date
+    )
+
+    end = DummyOperator(task_id='end')
+
+    start >> create_tables >> full_insert >> traffic >> end
