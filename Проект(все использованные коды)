@@ -211,7 +211,7 @@ begin
     GET DIAGNOSTICS v_cnt = ROW_COUNT;
     RAISE NOTICE 'INSERTED ROWS: %', v_cnt;
     
-    /*ON CONFLICT не работает? собираем строку название столбцов для обновления данных, исключая столбцы, которые используются для дистрибуции*/
+
     /*SELECT string_agg('d.' || column_name || ' = tmp.' || column_name, ', ' order by ordinal_position) into v_param_values
 	FROM information_schema.columns
 	WHERE table_schema||'.'||table_name = p_table and v_dist_key not like '%'|| column_name || '%' ;*/
@@ -309,7 +309,6 @@ begin
     GET DIAGNOSTICS v_cnt = ROW_COUNT;
     RAISE NOTICE 'INSERTED ROWS: %', v_cnt;
     
-    /*ON CONFLICT не работает? собираем строку название столбцов для обновления данных, исключая столбцы, которые используются для дистрибуции*/
     /*SELECT string_agg('d.' || column_name || ' = tmp.' || column_name, ', ' order by ordinal_position) into v_param_values
 	FROM information_schema.columns
 	WHERE table_schema||'.'||table_name = p_table and v_dist_key not like '%'|| column_name || '%' ;*/
@@ -451,8 +450,7 @@ begin
     /*получаем количество строк и выводим в лог это число*/
     GET DIAGNOSTICS v_cnt = ROW_COUNT;
     RAISE NOTICE 'INSERTED ROWS: %', v_cnt;
-    
-    /*ON CONFLICT не работает? собираем строку название столбцов для обновления данных, исключая столбцы, которые используются для дистрибуции*/
+
     /*SELECT string_agg('d.' || column_name || ' = tmp.' || column_name, ', ' order by ordinal_position) into v_param_values
 	FROM information_schema.columns
 	WHERE table_schema||'.'||table_name = p_table and v_dist_key not like '%'|| column_name || '%' ;*/
